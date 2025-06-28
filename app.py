@@ -1,20 +1,37 @@
+# TRACKER_PROJECT/app.py
+
 import tkinter as tk
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
-import subprocess
+# import subprocess  # <<< ALTERAÇÃO: Não precisamos mais do subprocess para isto
 import os
 import threading
 import requests
-import json
+# import json        # <<< ALTERAÇÃO: Não é usado diretamente aqui
 import sys
 
-# Supondo que 'contar.py' está no mesmo diretório.
+# --- Importação dos scripts locais com tratamento de erro ---
+
+# Importa a função de contagem principal
 try:
     from contar import contar_veiculos
 except ImportError:
     def contar_veiculos(*args, **kwargs):
         messagebox.showerror("Erro Crítico", "O arquivo 'contar.py' não foi encontrado. A função principal de contagem está ausente.")
         raise ImportError("O arquivo 'contar.py' ou a função 'contar_veiculos' não foi encontrada.")
+
+# <<< ALTERAÇÃO 1: Importar a classe AreaSelector que modificamos
+try:
+    from definir_areas import AreaSelector
+except ImportError:
+    messagebox.showerror("Erro Crítico", "O arquivo 'definir_areas.py' não foi encontrado. A função de definição de áreas está ausente.")
+    # Criamos uma classe 'placeholder' para que a app não quebre ao iniciar
+    class AreaSelector:
+        def __init__(self, *args, **kwargs):
+            print("Classe AreaSelector não encontrada.")
+        def run(self, *args, **kwargs):
+            messagebox.showerror("Erro", "Não é possível definir áreas. 'definir_areas.py' está em falta.")
+
 
 # --- Constantes de Configuração ---
 MODEL_DIR = "models"
@@ -46,7 +63,7 @@ class App(ctk.CTk):
         ctk.set_default_color_theme("dark-blue")
 
         # --- Variáveis de Estado ---
-        self.video_path_global = None
+        self.video_path_global = "" # <<< ALTERAÇÃO: Inicializar como string vazia para consistência
         self.last_report_path = None
         self.video_source_type = ctk.StringVar(value="local")
         self.model_name = ctk.StringVar(value="yolov5nu.pt")
@@ -135,34 +152,65 @@ class App(ctk.CTk):
             self.video_path_global = path
             self.update_status(f"Arquivo: {os.path.basename(path)}", "success")
         else:
-            self.video_path_global = None
+            self.video_path_global = ""
             self.update_status("Nenhum vídeo selecionado.", "warning")
             
+    # <<< ALTERAÇÃO 2: Função totalmente reescrita para integrar com `definir_areas.py`
     def open_define_areas(self):
-        """Abre o script para definição de áreas."""
-        try:
-            subprocess.Popen([sys.executable, "definir_areas.py"])
-            self.update_status("Janela de definição de áreas aberta.")
-        except FileNotFoundError:
-            messagebox.showerror("Erro", "O arquivo 'definir_areas.py' não foi encontrado.")
-            self.update_status("Erro: 'definir_areas.py' não encontrado.", "error")
-        except Exception as e:
-            messagebox.showerror("Erro", f"Ocorreu um erro ao abrir 'definir_areas.py': {e}")
-            self.update_status("Erro ao abrir definição de áreas.", "error")
-            
-    def start_counting(self):
-        """Inicia a validação e o processo de contagem."""
-        # Validação do vídeo
+        """
+        Abre o seletor de áreas usando o vídeo selecionado na UI, sem usar subprocess.
+        """
+        # 1. Determina qual a fonte do vídeo com base na seleção da UI
+        source_type = self.video_source_type.get()
+        video_source = ""
+
+        if source_type == "local":
+            video_source = self.video_path_global
+            if not video_source:
+                messagebox.showerror("Erro", "Por favor, selecione um arquivo de vídeo local primeiro.")
+                return
+        else: # "url"
+            video_source = self.video_url_entry.get().strip()
+            if not video_source:
+                messagebox.showerror("Erro", "Por favor, insira uma URL de vídeo primeiro.")
+                return
+
+        # 2. Executa o seletor de áreas numa thread para não congelar a UI
+        self.update_status("Abrindo janela para definir áreas...")
+        
+        # A função alvo da thread
+        def run_area_selector():
+            try:
+                selector = AreaSelector()
+                selector.run(video_source=video_source)
+                # self.after(0, lambda: self.update_status("Janela de áreas fechada.", "info"))
+            except Exception as e:
+                # self.after(0, lambda: messagebox.showerror("Erro", f"Falha ao abrir definidor de áreas: {e}"))
+                print(f"Erro na thread de AreaSelector: {e}")
+
+        # Inicia a thread
+        self.run_in_thread(run_area_selector)
+        
+    def get_current_video_source(self):
+        """Valida e retorna a fonte de vídeo atual (local ou URL)."""
         if self.video_source_type.get() == "local":
             if not self.video_path_global:
                 messagebox.showerror("Erro de Validação", "Selecione um arquivo de vídeo local.")
-                return
-            final_video_path = self.video_path_global
+                return None
+            return self.video_path_global
         else: # URL
             final_video_path = self.video_url_entry.get().strip()
             if not (final_video_path.startswith("http://") or final_video_path.startswith("https://")):
                 messagebox.showerror("Erro de Validação", "Por favor, insira uma URL de vídeo válida.")
-                return
+                return None
+            return final_video_path
+            
+    def start_counting(self):
+        """Inicia a validação e o processo de contagem."""
+        # Validação do vídeo
+        final_video_path = self.get_current_video_source()
+        if not final_video_path:
+            return
 
         # Validação do arquivo de áreas
         if not os.path.exists(AREAS_PATH):
@@ -217,8 +265,8 @@ class App(ctk.CTk):
             relatorio_path, saida_video_path = contar_veiculos(video_source, AREAS_PATH, model_path, show_video=True)
             self.last_report_path = relatorio_path
             msg = f"Contagem finalizada!\nRelatório: {relatorio_path}\nVídeo: {saida_video_path}"
-            messagebox.showinfo("Concluído", msg)
             self.update_status("Processamento concluído com sucesso!", "success")
+            messagebox.showinfo("Concluído", msg)
         except Exception as e:
             messagebox.showerror("Erro na Contagem", f"Ocorreu um erro: {e}")
             self.update_status(f"Erro na contagem: {e}", "error")
@@ -279,4 +327,3 @@ class App(ctk.CTk):
 if __name__ == "__main__":
     app = App()
     app.mainloop()
-1

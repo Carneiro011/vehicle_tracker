@@ -1,3 +1,5 @@
+# TRACKER_PROJECT/definir_areas.py
+
 import cv2
 import numpy as np
 import json
@@ -15,11 +17,11 @@ class AreaSelector:
         self.window_name = window_name
         self.FONT = cv2.FONT_HERSHEY_SIMPLEX
         self.COLORS = {
-            "entry": (0, 255, 0),       # Verde
+            "entry": (0, 255, 0),      # Verde
             "exit": (0, 0, 255),        # Vermelho
             "drawing": (0, 255, 255),   # Amarelo
             "highlight": (255, 100, 0), # Azul claro
-            "text": (255, 255, 255),     # Branco
+            "text": (255, 255, 255),      # Branco
             "button_bg": (80, 80, 80),
             "button_text": (255, 255, 255)
         }
@@ -162,15 +164,26 @@ class AreaSelector:
         
         messagebox.showinfo("Salvo", f"Áreas salvas com sucesso em:\n{os.path.abspath(path)}")
 
-    def run(self):
-        """Inicia e gerencia o loop principal da aplicação."""
-        video_path = self._select_video()
+    # <<< ALTERAÇÃO 1: Adicionamos o parâmetro "video_source=None"
+    def run(self, video_source=None):
+        """
+        Inicia e gerencia o loop principal da aplicação.
+        Pode receber um caminho de vídeo diretamente.
+        """
+        video_path = video_source
+
+        # <<< ALTERAÇÃO 2: Se nenhum caminho foi passado, abre o seletor de ficheiros
         if not video_path:
+            video_path = self._select_video()
+        
+        # Se ainda não houver caminho (utilizador cancelou), encerra a função
+        if not video_path:
+            print("Nenhum vídeo selecionado. Encerrando.")
             return
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            messagebox.showerror("Erro", "Não foi possível abrir o vídeo.")
+            messagebox.showerror("Erro", f"Não foi possível abrir o vídeo:\n{video_path}")
             return
 
         ret, frame = cap.read()
@@ -213,5 +226,6 @@ class AreaSelector:
 
 
 if __name__ == "__main__":
+    # <<< ALTERAÇÃO 3: Agora, se executar este ficheiro diretamente, ele funciona como antes.
     app = AreaSelector()
     app.run()
