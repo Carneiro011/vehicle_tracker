@@ -1,4 +1,5 @@
 # contar.py
+
 import os
 import cv2
 import json
@@ -6,174 +7,288 @@ import numpy as np
 from ultralytics import YOLO
 import datetime
 import math
+import logging
+import sqlite3
+import tkinter as tk
+from tkinter import messagebox
 
-def contar_veiculos(video_path, areas_path, model_path, show_video=True):
-    # ... (toda a parte inicial de configuração até antes do loop permanece a mesma) ...
-    pasta_saida = "resultados"
-    os.makedirs(pasta_saida, exist_ok=True)
-    caminho_saida_video = os.path.join(pasta_saida, "saida_com_contagem.mp4")
-    caminho_relatorio = os.path.join(pasta_saida, "relatorio.txt")
+# --- Configuração básica de logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
+# --- Banco de dados para histórico de relatórios ---
+DB_PATH = os.path.join("resultados", "relatorios.db")
+
+def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS relatorios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            report_path TEXT NOT NULL,
+            video_source TEXT NOT NULL,
+            model_used TEXT NOT NULL
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def log_report(timestamp, report_path, video_source, model_used):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO relatorios (timestamp, report_path, video_source, model_used)
+        VALUES (?, ?, ?, ?)
+    ''', (timestamp, report_path, video_source, model_used))
+    conn.commit()
+    conn.close()
+
+def contar_veiculos(video_path, areas_path, model_path, classes_selecionadas, show_video=True):
+    """
+    Conta veículos em um vídeo usando YOLO, exibindo em tempo real
+    hora local e totais de entradas/saídas, e ao fechar a janela
+    pergunta se deve salvar o relatório.
+    """
+    init_db()
+    logging.info("Iniciando contagem de veículos.")
+    inicio_real = datetime.datetime.now()
+
+    # --- Preparar pastas e nomes ---
+    os.makedirs("resultados", exist_ok=True)
+    ts_str = inicio_real.strftime("%Y%m%d_%H%M%S")
+    caminho_saida_video = os.path.join("resultados", f"saida_{ts_str}.mp4")
+    caminho_relatorio    = os.path.join("resultados", f"relatorio_{ts_str}.txt")
+
+    # --- Carregar áreas ---
     try:
-        with open(areas_path, "r") as f:
+        with open(areas_path, "r", encoding="utf-8") as f:
             areas = json.load(f)
-        if not (isinstance(areas, list) and len(areas) == 2 and
-                all(isinstance(a, list) and len(a) >= 3 for a in areas)):
-            raise ValueError("O arquivo de áreas está em um formato inválido ou incompleto.")
-        area_entrada_original = np.array(areas[0], dtype=np.int32)
-        area_saida_original = np.array(areas[1], dtype=np.int32)
+        if not (isinstance(areas, list) and len(areas) == 2):
+            raise ValueError("Esperado lista com 2 áreas (entrada, saída).")
+        for a in areas:
+            if not (isinstance(a, list) and len(a) >= 3):
+                raise ValueError("Cada área deve ter pelo menos 3 pontos.")
+        area_ent_orig = np.array(areas[0], dtype=np.int32)
+        area_sai_orig = np.array(areas[1], dtype=np.int32)
     except Exception as e:
-        raise ValueError(f"Erro ao carregar áreas do arquivo {areas_path}: {e}")
+        raise ValueError(f"Erro ao carregar áreas '{areas_path}': {e}")
 
+    # --- Carregar modelo YOLO ---
     try:
         modelo = YOLO(model_path)
     except Exception as e:
-        raise RuntimeError(f"Erro ao carregar o modelo YOLO '{model_path}': {e}")
+        raise RuntimeError(f"Erro ao carregar modelo '{model_path}': {e}")
 
-    nome_classe = {2: "Carro", 3: "Moto", 5: "Onibus", 7: "Caminhao"}
-    classes_interesse = list(nome_classe.keys())
+    # --- Preparar contadores ---
+    TODAS_AS_CLASSES = {0:"Pessoa",1:"Bicicleta",2:"Carro",3:"Moto",5:"Onibus",7:"Caminhao"}
+    nomes_sel    = [TODAS_AS_CLASSES[c] for c in classes_selecionadas if c in TODAS_AS_CLASSES]
+    cont_ent     = {n:0 for n in nomes_sel}
+    cont_sai     = {n:0 for n in nomes_sel}
+    ids_ent, ids_sai = set(), set()
+    estados      = {}  # track_id → {'in_entry':bool,'in_exit':bool}
+    eventos_ent  = []  # {'time': datetime, 'type': nome}
+    eventos_sai  = []
 
-    cont_entrada_total = {nome: 0 for nome in nome_classe.values()}
-    cont_saida_total = {nome: 0 for nome in nome_classe.values()}
-    ids_unicos_entrada = set()
-    ids_unicos_saida = set()
-    vehicle_tracking_states = {}
-    hourly_entry_events = []
-    hourly_exit_events = []
-
+    # --- Abrir vídeo e saída ---
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise IOError(f"Não foi possível abrir o vídeo em {video_path}.")
+        raise IOError(f"Não foi possível abrir vídeo '{video_path}'.")
+    w_o = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h_o = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS)) if cap.get(cv2.CAP_PROP_FPS)>0 else 30
+    w_out, h_out = 1280, 720
 
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    largura_video_original = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    altura_video_original = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frame_width_out, frame_height_out = 1280, 720
-
-    video_out = cv2.VideoWriter(caminho_saida_video, cv2.VideoWriter_fourcc(*'mp4v'), fps, (frame_width_out, frame_height_out))
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_out = cv2.VideoWriter(caminho_saida_video, fourcc, fps, (w_out,h_out))
     if not video_out.isOpened():
-        raise IOError(f"Não foi possível criar o arquivo de vídeo de saída em {caminho_saida_video}.")
+        raise IOError(f"Não foi possível criar '{caminho_saida_video}'.")
 
-    fator_escala_x = frame_width_out / largura_video_original
-    fator_escala_y = frame_height_out / altura_video_original
-    area_entrada_ajustada = np.array([[int(p[0] * fator_escala_x), int(p[1] * fator_escala_y)] for p in area_entrada_original], dtype=np.int32)
-    area_saida_ajustada = np.array([[int(p[0] * fator_escala_x), int(p[1] * fator_escala_y)] for p in area_saida_original], dtype=np.int32)
-    
-    # Loop principal para processar cada frame do vídeo
-    while cap.isOpened():
+    # ajustar polígonos
+    fx, fy = w_out/w_o, h_out/h_o
+    area_ent = np.array([[int(x*fx),int(y*fy)] for x,y in area_ent_orig], dtype=np.int32)
+    area_sai = np.array([[int(x*fx),int(y*fy)] for x,y in area_sai_orig], dtype=np.int32)
+
+    # --- Laço de processamento ---
+    window_name = "Processando - pressione 'q' para sair"
+    break_on_x = False
+
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        current_frame_timestamp_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-        current_seconds = current_frame_timestamp_ms / 1000.0
+        # calcula hora real do evento
+        t_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+        t_s  = t_ms / 1000.0
+        hora_evt = inicio_real + datetime.timedelta(seconds=t_s)
 
-        frame = cv2.resize(frame, (frame_width_out, frame_height_out))
+        frame = cv2.resize(frame, (w_out,h_out))
+        res = modelo.track(source=frame, tracker="botsort.yaml",
+                            persist=True, classes=classes_selecionadas)[0]
 
-        # <<< ALTERAÇÃO 1: Realiza a detecção no frame LIMPO
-        resultados = modelo.track(source=frame, tracker="botsort.yaml", persist=True, verbose=False)[0]
-        
-        # <<< ALTERAÇÃO 2: Cria uma cópia do frame para desenhar
-        frame_para_exibicao = frame.copy()
+        disp = frame.copy()
+        overlay = disp.copy()
+        cv2.fillPoly(overlay, [area_ent], (0,255,0))
+        cv2.fillPoly(overlay, [area_sai], (0,0,255))
+        cv2.addWeighted(overlay, 0.3, disp, 0.7, 0, disp)
+        cv2.polylines(disp, [area_ent], True, (0,255,0), 2)
+        cv2.polylines(disp, [area_sai], True, (0,0,255), 2)
 
-        # Desenha as áreas de interesse no frame de exibição
-        overlay = frame_para_exibicao.copy()
-        cv2.fillPoly(overlay, [area_entrada_ajustada], (0, 255, 0))
-        cv2.fillPoly(overlay, [area_saida_ajustada], (0, 0, 255))
-        alpha = 0.3
-        cv2.addWeighted(overlay, alpha, frame_para_exibicao, 1 - alpha, 0, frame_para_exibicao)
-        cv2.polylines(frame_para_exibicao, [area_entrada_ajustada], True, (0, 255, 0), 2)
-        cv2.polylines(frame_para_exibicao, [area_saida_ajustada], True, (0, 0, 255), 2)
+        # sobrepõe a hora atual
+        cv2.putText(disp,
+            hora_evt.strftime("%Y-%m-%d %H:%M:%S"),
+            (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2
+        )
 
-        current_frame_track_ids = set()
+        # processa detecções
+        if hasattr(res.boxes, 'id') and res.boxes.id is not None:
+            ids_ = res.boxes.id.int().cpu().tolist()
+            bxs  = res.boxes.xyxy.cpu().tolist()
+            clss = res.boxes.cls.int().cpu().tolist()
 
-        if resultados.boxes.id is not None:
-            ids = resultados.boxes.id.int().cpu().tolist()
-            boxes = resultados.boxes.xyxy.cpu().tolist()
-            classes = resultados.boxes.cls.int().cpu().tolist()
+            for (x1,y1,x2,y2), c, tid in zip(bxs, clss, ids_):
+                if c not in classes_selecionadas:
+                    continue
+                nome = TODAS_AS_CLASSES.get(c, "Desconhecido")
+                cx, cy = int((x1+x2)/2), int((y1+y2)/2)
 
-            for box, cls, track_id in zip(boxes, classes, ids):
-                if cls in classes_interesse:
-                    nome = nome_classe[cls]
-                    x1, y1, x2, y2 = map(int, box)
-                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                if tid not in estados:
+                    estados[tid] = {'in_entry':False,'in_exit':False}
 
-                    # <<< ALTERAÇÃO 3: Desenha a caixa e o ID no frame de exibição
-                    cv2.rectangle(frame_para_exibicao, (x1, y1), (x2, y2), (255, 0, 0), 2)
-                    cv2.putText(frame_para_exibicao, f"{nome} ID: {track_id}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+                # entrada
+                in_ent = cv2.pointPolygonTest(area_ent, (cx,cy), False) >= 0
+                if in_ent and not estados[tid]['in_entry']:
+                    eventos_ent.append({'time':hora_evt, 'type':nome})
+                    if tid not in ids_ent:
+                        ids_ent.add(tid)
+                        cont_ent[nome] += 1
+                    estados[tid]['in_entry'] = True
+                elif not in_ent:
+                    estados[tid]['in_entry'] = False
 
-                    current_frame_track_ids.add(track_id)
+                # saída
+                in_sai = cv2.pointPolygonTest(area_sai, (cx,cy), False) >= 0
+                if in_sai and not estados[tid]['in_exit']:
+                    eventos_sai.append({'time':hora_evt, 'type':nome})
+                    if tid not in ids_sai:
+                        ids_sai.add(tid)
+                        cont_sai[nome] += 1
+                    estados[tid]['in_exit'] = True
+                elif not in_sai:
+                    estados[tid]['in_exit'] = False
 
-                    if track_id not in vehicle_tracking_states:
-                        vehicle_tracking_states[track_id] = {'type': nome, 'was_in_entry_zone': False, 'was_in_exit_zone': False}
-                    
-                    is_in_entry_now = cv2.pointPolygonTest(area_entrada_ajustada, (cx, cy), False) >= 0
-                    was_in_entry_before = vehicle_tracking_states[track_id]['was_in_entry_zone']
+                # desenha bbox
+                cv2.rectangle(disp, (int(x1),int(y1)), (int(x2),int(y2)), (255,0,0), 2)
+                cv2.putText(disp, f"{nome} ID:{tid}",
+                            (int(x1),int(y1)-6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,0), 2)
 
-                    if is_in_entry_now and not was_in_entry_before:
-                        hourly_entry_events.append({'time_seconds': current_seconds, 'type': nome})
-                        ids_unicos_entrada.add(track_id)
-                        cont_entrada_total[nome] += 1
-                        vehicle_tracking_states[track_id]['was_in_entry_zone'] = True
-                    elif not is_in_entry_now and was_in_entry_before:
-                        vehicle_tracking_states[track_id]['was_in_entry_zone'] = False
+        # desenha contadores dinâmicos
+        y0 = 40
+        cv2.putText(disp, "ENTRADAS:", (10, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+        y0 += 25
+        for n,q in cont_ent.items():
+            cv2.putText(disp, f"{n}: {q}", (10,y0),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+            y0 += 20
 
-                    is_in_exit_now = cv2.pointPolygonTest(area_saida_ajustada, (cx, cy), False) >= 0
-                    was_in_exit_before = vehicle_tracking_states[track_id]['was_in_exit_zone']
+        y0 += 10
+        cv2.putText(disp, "SAÍDAS:", (10, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+        y0 += 25
+        for n,q in cont_sai.items():
+            cv2.putText(disp, f"{n}: {q}", (10,y0),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+            y0 += 20
 
-                    if is_in_exit_now and not was_in_exit_before:
-                        hourly_exit_events.append({'time_seconds': current_seconds, 'type': nome})
-                        ids_unicos_saida.add(track_id)
-                        cont_saida_total[nome] += 1
-                        vehicle_tracking_states[track_id]['was_in_exit_zone'] = True
-                    elif not is_in_exit_now and was_in_exit_before:
-                        vehicle_tracking_states[track_id]['was_in_exit_zone'] = False
-        
-        keys_to_reset = [tid for tid in vehicle_tracking_states if tid not in current_frame_track_ids]
-        for tid in keys_to_reset:
-            vehicle_tracking_states[tid]['was_in_entry_zone'] = False
-            vehicle_tracking_states[tid]['was_in_exit_zone'] = False
-
-        # <<< ALTERAÇÃO 4: Desenha o painel de contagem no frame de exibição
-        y_offset_count = 30
-        cv2.putText(frame_para_exibicao, "Contagem TOTAL:", (10, y_offset_count), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        y_offset_count += 30
-        for nome, qtd in cont_entrada_total.items():
-            cv2.putText(frame_para_exibicao, f"Entrada {nome}: {qtd}", (10, y_offset_count), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            y_offset_count += 25
-        y_offset_count += 10
-        for nome, qtd in cont_saida_total.items():
-            cv2.putText(frame_para_exibicao, f"Saida {nome}: {qtd}", (10, y_offset_count), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            y_offset_count += 25
-
-        # <<< ALTERAÇÃO 5: Salva e exibe o frame com tudo desenhado
-        video_out.write(frame_para_exibicao)
-
+        video_out.write(disp)
         if show_video:
-            cv2.imshow("Processando Video - Pressione 'q' para fechar", frame_para_exibicao)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            cv2.imshow(window_name, disp)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            # detecta clique no X
+            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                break_on_x = True
                 break
 
-    # Libera recursos
+    # libera recursos
     cap.release()
     video_out.release()
     if show_video:
         cv2.destroyAllWindows()
 
-    # --- Geração do Relatório Detalhado (sem alterações aqui) ---
-    # (O código de geração de relatório permanece exatamente o mesmo)
-    # ... (código do relatório omitido para brevidade, mas deve ser mantido no seu ficheiro) ...
-    with open(caminho_relatorio, "w", encoding="utf-8") as f: # Adicionado encoding utf-8 por segurança
-        # (Cole aqui toda a sua lógica de escrita de relatório)
-        # ...
-        f.write("RELATÓRIO DE CONTAGEM DE VEÍCULOS\n")
-        f.write("="*40 + "\n\n")
+    # se fechou via X, pergunta se salva
+    save = True
+    if break_on_x:
+        root = tk.Tk(); root.withdraw()
+        save = messagebox.askyesno("Salvar Relatório", "Deseja salvar o relatório?")
+        root.destroy()
 
-        if not hourly_entry_events and not hourly_exit_events:
-            f.write("Nenhum veículo detectado ou áreas não cruzadas.\n\n")
-        else:
-            f.write("TOTAIS GERAIS (ID ÚNICO POR ÁREA):\n")
-            # ... resto da sua lógica de relatório ...
+    if save:
+        # gera relatório em disco
+        with open(caminho_relatorio, "w", encoding="utf-8") as f:
+            f.write("RELATÓRIO DE CONTAGEM DE VEÍCULOS\n")
+            f.write("="*40 + "\n\n")
+            # Totais gerais
+            f.write("TOTAIS GERAIS (IDs únicos):\n")
+            for n in nomes_sel:
+                f.write(f"  Entrada {n}: {cont_ent[n]}\n")
+            f.write(f"  Total IDs entrada: {len(ids_ent)}\n\n")
+            for n in nomes_sel:
+                f.write(f"  Saída {n}: {cont_sai[n]}\n")
+            f.write(f"  Total IDs saída: {len(ids_sai)}\n\n")
 
+            # Fluxo horário de ENTRADAS
+            f.write("FLUXO HORÁRIO (ENTRADAS) — Horário Local\n")
+            f.write("-"*40 + "\n")
+            if eventos_ent:
+                agrup = {}
+                for ev in eventos_ent:
+                    h = ev['time'].replace(minute=0, second=0, microsecond=0)
+                    agrup.setdefault(h, {**{n:0 for n in nomes_sel}, '_total':0})
+                    agrup[h][ev['type']] += 1
+                    agrup[h]['_total']   += 1
+                for h, dados in sorted(agrup.items()):
+                    end = h + datetime.timedelta(hours=1) - datetime.timedelta(seconds=1)
+                    f.write(f"{h.strftime('%Y-%m-%d %H:%M:%S')} → {end.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    for n in nomes_sel:
+                        if dados[n] > 0:
+                            f.write(f"  {n}: {dados[n]}\n")
+                    f.write(f"  Total: {dados['_total']}\n\n")
+            else:
+                f.write("  Nenhum evento de entrada.\n\n")
 
-    return caminho_relatorio, caminho_saida_video
+            # Fluxo horário de SAÍDAS
+            f.write("FLUXO HORÁRIO (SAÍDAS) — Horário Local\n")
+            f.write("-"*40 + "\n")
+            if eventos_sai:
+                agrup = {}
+                for ev in eventos_sai:
+                    h = ev['time'].replace(minute=0, second=0, microsecond=0)
+                    agrup.setdefault(h, {**{n:0 for n in nomes_sel}, '_total':0})
+                    agrup[h][ev['type']] += 1
+                    agrup[h]['_total']   += 1
+                for h, dados in sorted(agrup.items()):
+                    end = h + datetime.timedelta(hours=1) - datetime.timedelta(seconds=1)
+                    f.write(f"{h.strftime('%Y-%m-%d %H:%M:%S')} → {end.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    for n in nomes_sel:
+                        if dados[n] > 0:
+                            f.write(f"  {n}: {dados[n]}\n")
+                    f.write(f"  Total: {dados['_total']}\n\n")
+            else:
+                f.write("  Nenhum evento de saída.\n\n")
+
+        logging.info(f"Relatório gravado em '{caminho_relatorio}'")
+        # registra no banco
+        now_iso = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
+        log_report(now_iso, caminho_relatorio, video_path, os.path.basename(model_path))
+        return caminho_relatorio, caminho_saida_video
+    else:
+        logging.info("Usuário optou por não salvar o relatório.")
+        return None, caminho_saida_video
