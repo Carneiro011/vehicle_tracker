@@ -198,7 +198,7 @@ def contar_veiculos(video_path, areas_path, model_path, classes_selecionadas, sh
             y0 += 20
 
         y0 += 10
-        cv2.putText(disp, "SAÍDAS:", (10, y0),
+        cv2.putText(disp, "SAIDAS:", (10, y0),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
         y0 += 25
         for n,q in cont_sai.items():
@@ -265,7 +265,7 @@ def contar_veiculos(video_path, areas_path, model_path, classes_selecionadas, sh
                 f.write("  Nenhum evento de entrada.\n\n")
 
             # Fluxo horário de SAÍDAS
-            f.write("FLUXO HORÁRIO (SAÍDAS) — Horário Local\n")
+            f.write("FLUXO HORÁRIO (SAIDAS) — Horário Local\n")
             f.write("-"*40 + "\n")
             if eventos_sai:
                 agrup = {}

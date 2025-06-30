@@ -108,7 +108,7 @@ class AreaSelector:
         
         instructions = [
             "Clique ESQUERDO para adicionar ou arrastar pontos.",
-            "Clique DIREITO para finalizar a área atual.",
+            "Clique DIREITO para finalizar a area atual.",
             "Z: Reiniciar area ATUAL | R: Reiniciar TUDO",
             "S: Salvar e Sair | ESC: Sair sem Salvar"
         ]
