@@ -4,29 +4,25 @@ venv/
 *.venv
 env/
 /env
-
 # Cache do Python
 __pycache__/
 *.py[cod]
 *$py.class
-
 # Arquivos de IDE e Editores
 .vscode/
 .idea/
 *.swp
-
 # Arquivos de Pacotes e Instalação
 *.egg-info/
 dist/
 build/
 *.spec
-
 # Arquivos de Sistema Operacional
 .DS_Store
 Thumbs.db
-
-# Arquivos gerados pelo seu aplicativo (opcional, mas recomendado)
+# Arquivos gerados pelo app
 /resultados/areas.json
 /resultados/*.txt
 /resultados/*.mp4
 /models/*.pt
+/videos/

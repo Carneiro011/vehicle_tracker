@@ -66,7 +66,7 @@ def contar_veiculos(
     logging.info("Iniciando contagem de veículos.")
     inicio_real = datetime.datetime.now()
 
-    # --- Preparar pastas e nomes ---
+    # --- Preparar pasta e nome do relatório ---
     os.makedirs("resultados", exist_ok=True)
     ts_str = inicio_real.strftime("%Y%m%d_%H%M%S")
     cam_str = camera_name.strip().replace(" ", "_") if camera_name else ""
@@ -75,9 +75,8 @@ def contar_veiculos(
         nome_rel += f"_{cam_str}"
     nome_rel += ".txt"
     caminho_relatorio = os.path.join("resultados", nome_rel)
-    caminho_saida_video = os.path.join("resultados", f"saida_{ts_str}.mp4")
 
-    # --- Carregar áreas ---
+    # --- Carregar áreas de entrada/saída ---
     try:
         with open(areas_path, "r", encoding="utf-8") as f:
             areas = json.load(f)
@@ -97,7 +96,7 @@ def contar_veiculos(
     except Exception as e:
         raise RuntimeError(f"Erro ao carregar modelo '{model_path}': {e}")
 
-    # --- Preparar contadores ---
+    # --- Preparar contadores e estruturas ---
     TODAS_AS_CLASSES = {0:"Pessoa",1:"Bicicleta",2:"Carro",
                        3:"Moto",5:"Onibus",7:"Caminhao"}
     nomes_sel    = [TODAS_AS_CLASSES[c] for c in classes_selecionadas
@@ -109,7 +108,7 @@ def contar_veiculos(
     eventos_ent  = []
     eventos_sai  = []
 
-    # --- Abrir vídeo e saída ---
+    # --- Abrir vídeo ---
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Não foi possível abrir vídeo '{video_path}'.")
@@ -118,26 +117,20 @@ def contar_veiculos(
     fps = int(cap.get(cv2.CAP_PROP_FPS)) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
     w_out, h_out = 1280, 720
 
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_out = cv2.VideoWriter(caminho_saida_video, fourcc, fps, (w_out,h_out))
-    if not video_out.isOpened():
-        raise IOError(f"Não foi possível criar '{caminho_saida_video}'.")
-
     fx, fy = w_out / w_o, h_out / h_o
-    area_ent = np.array([[int(x*fx), int(y*fy)]
-                         for x,y in area_ent_orig], dtype=np.int32)
-    area_sai = np.array([[int(x*fx), int(y*fy)]
-                         for x,y in area_sai_orig], dtype=np.int32)
+    area_ent = np.array([[int(x*fx), int(y*fy)] for x,y in area_ent_orig], dtype=np.int32)
+    area_sai = np.array([[int(x*fx), int(y*fy)] for x,y in area_sai_orig], dtype=np.int32)
 
-    # --- Preparar janela em 1280×720 e toggle fullscreen com 'f' ---
+    # --- Configurar janela de exibição ---
     window_name = "Processando - 'f' fullscreen, 'q' sair"
     fullscreen = False
     if show_video:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, 1280, 720)
+        cv2.resizeWindow(window_name, w_out, h_out)
 
-    # --- Laço de processamento ---
     break_on_x = False
+
+    # --- Loop de processamento de frames ---
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -146,10 +139,12 @@ def contar_veiculos(
         t_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
         hora_evt = inicio_real + datetime.timedelta(seconds=(t_ms / 1000.0))
 
-        frame = cv2.resize(frame, (w_out,h_out))
+        frame = cv2.resize(frame, (w_out, h_out))
         res = modelo.track(
-            source=frame, tracker="botsort.yaml",
-            persist=True, classes=classes_selecionadas
+            source=frame,
+            tracker="botsort.yaml",
+            persist=True,
+            classes=classes_selecionadas
         )[0]
 
         disp = frame.copy()
@@ -161,10 +156,17 @@ def contar_veiculos(
         cv2.polylines(disp, [area_sai], True, (0,0,255), 2)
 
         cv2.putText(
-            disp, hora_evt.strftime("%Y-%m-%d %H:%M:%S"),
-            (10, 20), FONT, 0.6, (255,255,255), THICKNESS, LINE_TYPE
+            disp,
+            hora_evt.strftime("%Y-%m-%d %H:%M:%S"),
+            (10, 20),
+            FONT,
+            0.6,
+            (255,255,255),
+            THICKNESS,
+            LINE_TYPE
         )
 
+        # Processa cada detecção com ID
         if hasattr(res.boxes, 'id') and res.boxes.id is not None:
             ids_ = res.boxes.id.int().cpu().tolist()
             bxs  = res.boxes.xyxy.cpu().tolist()
@@ -173,59 +175,59 @@ def contar_veiculos(
                 if c not in classes_selecionadas:
                     continue
                 nome = TODAS_AS_CLASSES.get(c, "Desconhecido")
-                cx, cy = int((x1+x2)/2), int((y1+y2)/2)
-                estados.setdefault(tid, {'in_entry':False,'in_exit':False})
+                cx, cy = (int((x1+x2)/2), int((y1+y2)/2))
+                estados.setdefault(tid, {'in_entry':False, 'in_exit':False})
 
-                # Detecta entrada
-                in_ent = cv2.pointPolygonTest(area_ent, (cx,cy), False) >= 0
-                if in_ent and not estados[tid]['in_entry']:
-                    eventos_ent.append({'time':hora_evt, 'type':nome})
-                    if tid not in ids_ent:
-                        ids_ent.add(tid)
-                        cont_ent[nome] += 1
-                    estados[tid]['in_entry'] = True
-                elif not in_ent:
+                # Verifica entrada
+                if cv2.pointPolygonTest(area_ent, (cx,cy), False) >= 0:
+                    if not estados[tid]['in_entry']:
+                        eventos_ent.append({'time':hora_evt, 'type':nome})
+                        if tid not in ids_ent:
+                            ids_ent.add(tid)
+                            cont_ent[nome] += 1
+                        estados[tid]['in_entry'] = True
+                else:
                     estados[tid]['in_entry'] = False
 
-                # Detecta saída
-                in_sai = cv2.pointPolygonTest(area_sai, (cx,cy), False) >= 0
-                if in_sai and not estados[tid]['in_exit']:
-                    eventos_sai.append({'time':hora_evt, 'type':nome})
-                    if tid not in ids_sai:
-                        ids_sai.add(tid)
-                        cont_sai[nome] += 1
-                    estados[tid]['in_exit'] = True
-                elif not in_sai:
+                # Verifica saída
+                if cv2.pointPolygonTest(area_sai, (cx,cy), False) >= 0:
+                    if not estados[tid]['in_exit']:
+                        eventos_sai.append({'time':hora_evt, 'type':nome})
+                        if tid not in ids_sai:
+                            ids_sai.add(tid)
+                            cont_sai[nome] += 1
+                        estados[tid]['in_exit'] = True
+                else:
                     estados[tid]['in_exit'] = False
 
-                cv2.rectangle(disp, (int(x1),int(y1)),
-                              (int(x2),int(y2)), (255,0,0), 1)
+                # Desenha bbox e label
+                cv2.rectangle(disp, (int(x1),int(y1)), (int(x2),int(y2)), (255,0,0), 1)
                 cv2.putText(
-                    disp, f"{nome} ID:{tid}",
-                    (int(x1), int(y1)-6), FONT, 0.5,
-                    (255,0,0), THICKNESS, LINE_TYPE
+                    disp,
+                    f"{nome} ID:{tid}",
+                    (int(x1), int(y1)-6),
+                    FONT,
+                    0.5,
+                    (255,0,0),
+                    THICKNESS,
+                    LINE_TYPE
                 )
 
-        # Exibe contadores na tela
-        y0 = 40
-        cv2.putText(disp, "ENTRADAS:", (10, y0),
-                    FONT, 0.8, (0,255,0), THICKNESS, LINE_TYPE)
-        y0 += 25
-        for n, q in cont_ent.items():
-            cv2.putText(disp, f"{n}: {q}", (10, y0),
-                        FONT, 0.5, (0,255,0), THICKNESS, LINE_TYPE)
-            y0 += 20
+        # Mostra contadores na tela
+        y = 40
+        cv2.putText(disp, "ENTRADAS:", (10, y), FONT, 0.8, (0,255,0), THICKNESS, LINE_TYPE)
+        y += 25
+        for n, cnt in cont_ent.items():
+            cv2.putText(disp, f"{n}: {cnt}", (10, y), FONT, 0.5, (0,255,0), THICKNESS, LINE_TYPE)
+            y += 20
 
-        y0 += 10
-        cv2.putText(disp, "SAÍDAS:", (10, y0),
-                    FONT, 0.8, (0,0,255), THICKNESS, LINE_TYPE)
-        y0 += 25
-        for n, q in cont_sai.items():
-            cv2.putText(disp, f"{n}: {q}", (10, y0),
-                        FONT, 0.6, (0,0,255), THICKNESS, LINE_TYPE)
-            y0 += 20
+        y += 10
+        cv2.putText(disp, "SAIDAS:", (10, y), FONT, 0.8, (0,0,255), THICKNESS, LINE_TYPE)
+        y += 25
+        for n, cnt in cont_sai.items():
+            cv2.putText(disp, f"{n}: {cnt}", (10, y), FONT, 0.6, (0,0,255), THICKNESS, LINE_TYPE)
+            y += 20
 
-        video_out.write(disp)
         if show_video:
             cv2.imshow(window_name, disp)
             key = cv2.waitKey(1) & 0xFF
@@ -239,16 +241,14 @@ def contar_veiculos(
                 break_on_x = True
                 break
 
-    # --- Finaliza captura e gravação ---
+    # --- Limpa recursos ---
     cap.release()
-    video_out.release()
     if show_video:
         cv2.destroyAllWindows()
 
-    # --- Registra horário de término ---
     fim_real = datetime.datetime.now()
 
-    # --- Pergunta ao usuário se salva o relatório ---
+    # --- Pergunta se salva relatório ---
     save = True
     if break_on_x:
         root = tk.Tk(); root.withdraw()
@@ -257,7 +257,6 @@ def contar_veiculos(
 
     if save:
         with open(caminho_relatorio, "w", encoding="utf-8") as f:
-            # Cabeçalho com horários
             f.write("RELATÓRIO DE CONTAGEM DE VEÍCULOS\n")
             if camera_name:
                 f.write(f"CÂMERA: {camera_name}\n")
@@ -266,8 +265,6 @@ def contar_veiculos(
             duracao = fim_real - inicio_real
             f.write(f"Duração:            {str(duracao)}\n")
             f.write("="*40 + "\n\n")
-
-            # Totais gerais
             f.write("TOTAIS GERAIS (IDs únicos):\n")
             for n in nomes_sel:
                 f.write(f"  Entrada {n}: {cont_ent[n]}\n")
@@ -275,13 +272,10 @@ def contar_veiculos(
             for n in nomes_sel:
                 f.write(f"  Saída {n}: {cont_sai[n]}\n")
             f.write(f"  Total IDs saída: {len(ids_sai)}\n\n")
-
-            # (aqui você pode continuar escrevendo fluxos horários ou outros detalhes)
-
         logging.info(f"Relatório gravado em '{caminho_relatorio}'")
         now_iso = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
         log_report(now_iso, caminho_relatorio, video_path, os.path.basename(model_path))
-        return caminho_relatorio, caminho_saida_video
+        return caminho_relatorio
     else:
         logging.info("Usuário optou por não salvar o relatório.")
-        return None, caminho_saida_video
+        return None
