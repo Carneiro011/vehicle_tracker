@@ -8,6 +8,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 import requests
 
+from contar_nVideo import contar_veiculos_nVideo
 from contar import contar_veiculos
 from definir_areas import AreaSelector
 
@@ -50,6 +51,8 @@ class App(ctk.CTk):
         self.model_name = ctk.StringVar(value=list(YOLO_MODELS.keys())[0])
         self.camera_name = ctk.StringVar(value="")
         self.class_vars = {name: ctk.IntVar(value=1) for name in CLASSES_DISPONIVEIS}
+        self.show_video_var = ctk.BooleanVar(value=True)  # novo: controla se vídeo será exibido
+        self.stop_flag = threading.Event()  # novo: controla parada manual
 
         # Layout
         self.grid_columnconfigure(0, weight=1)
@@ -71,36 +74,44 @@ class App(ctk.CTk):
 
         # 1. Fonte do Vídeo
         ctk.CTkLabel(frm, text="1. Fonte do Vídeo", font=ctk.CTkFont(weight="bold")).grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10,5)
+        row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10,5)
         )
         ctk.CTkRadioButton(frm, text="Arquivo Local", variable=self.video_source_type,
-                           value="local", command=self.toggle_video_source_input).grid(row=1, column=0, sticky="w", padx=20)
+        value="local", command=self.toggle_video_source_input).grid(row=1, column=0, sticky="w", padx=20)
         ctk.CTkRadioButton(frm, text="URL (Stream)", variable=self.video_source_type,
-                           value="url", command=self.toggle_video_source_input).grid(row=1, column=1, sticky="w")
+        value="url", command=self.toggle_video_source_input).grid(row=1, column=1, sticky="w")
 
         self.btn_select = ctk.CTkButton(frm, text="Selecionar Vídeo", command=self.select_video_file)
         self.ent_url    = ctk.CTkEntry(frm, placeholder_text="https://.../video.mp4 ou .m3u8")
 
-        # separador
+     # separador
         ctk.CTkFrame(frm, height=2, fg_color="gray20").grid(
-            row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=15
-        )
+        row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=15
+     )
 
-        # 2. Modelo YOLO
+     # 2. Modelo YOLO
         ctk.CTkLabel(frm, text="2. Modelo YOLO", font=ctk.CTkFont(weight="bold")).grid(
-            row=5, column=0, columnspan=2, sticky="w", padx=10, pady=5
-        )
+        row=5, column=0, columnspan=2, sticky="w", padx=10, pady=5
+     )
         ctk.CTkOptionMenu(frm, variable=self.model_name, values=list(YOLO_MODELS.keys())).grid(
-            row=6, column=0, columnspan=2, sticky="ew", padx=10, pady=10
-        )
+        row=6, column=0, columnspan=2, sticky="ew", padx=10, pady=10
+     )
 
-        # 2.1 Nome da Câmera (opcional)
+      # 2.1 Nome da Câmera (opcional)
         ctk.CTkLabel(frm, text="Nome da Câmera (opcional)", font=ctk.CTkFont(weight="bold")).grid(
-            row=7, column=0, columnspan=2, sticky="w", padx=10, pady=(10,5)
-        )
+        row=7, column=0, columnspan=2, sticky="w", padx=10, pady=(10,5)
+     )
         ctk.CTkEntry(frm, textvariable=self.camera_name,
-                     placeholder_text="Ex: Entrada Principal").grid(
-            row=8, column=0, columnspan=2, sticky="ew", padx=10, pady=(0,10)
+        placeholder_text="Ex: Entrada Principal").grid(
+        row=8, column=0, columnspan=2, sticky="ew", padx=10, pady=(0,10)
+     )
+
+     # 3. Exibir Vídeo
+        ctk.CTkLabel(frm, text="3. Exibição de Vídeo", font=ctk.CTkFont(weight="bold")).grid(
+        row=9, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 5)
+        )
+        ctk.CTkCheckBox(frm, text="Exibir vídeo durante contagem", variable=self.show_video_var).grid(
+        row=10, column=0, columnspan=2, sticky="w", padx=20
         )
 
     def create_class_selection_frame(self):
@@ -137,6 +148,16 @@ class App(ctk.CTk):
                       fg_color="#3B8ED0").grid(
             row=3, column=0, pady=5, sticky="ew"
         )
+         # Botão para finalizar contagem manual (só aparece se show_video=False)
+        self.stop_counting_button = ctk.CTkButton(
+        frm,
+        text="Finalizar Contagem",
+        command=self.stop_counting,
+        fg_color="#E74C3C",
+        hover_color="#C0392B"
+    )
+        self.stop_counting_button.grid(row=4, column=0, pady=10, sticky="ew")
+        self.stop_counting_button.grid_remove()  # começa invisível
 
     def select_video_file(self):
         path = filedialog.askopenfilename(
@@ -188,12 +209,26 @@ class App(ctk.CTk):
         return [CLASSES_DISPONIVEIS[n] for n, v in self.class_vars.items() if v.get() == 1]
 
     def start_counting(self):
+        self.stop_flag.clear()
+        show_video = self.show_video_var.get()
+
+        # Alterna exibição do botão "Finalizar Contagem"
+        if not show_video:
+            self.stop_counting_button.grid()
+        else:
+            self.stop_counting_button.grid_remove()
+
+        # Verifica fonte de vídeo
         src = self.get_current_video_source()
         if not src:
             return
+
+        # Verifica se áreas foram definidas
         if not os.path.exists(AREAS_PATH):
             messagebox.showerror("Erro", "Defina as áreas primeiro.")
             return
+
+        # Verifica se há classes selecionadas
         ids = self.get_selected_ids()
         if not ids:
             messagebox.showerror("Erro", "Selecione pelo menos uma classe.")
@@ -202,6 +237,7 @@ class App(ctk.CTk):
         model = self.model_name.get()
         model_path = os.path.join(MODEL_DIR, model)
 
+        # Se o modelo não existe, pergunta se deve baixar
         if not os.path.exists(model_path):
             resp = messagebox.askyesno(
                 "Modelo Ausente",
@@ -211,17 +247,21 @@ class App(ctk.CTk):
             if not resp:
                 self.update_status("Contagem cancelada pelo usuário.", "warning")
                 return
+
             self.update_status(f"Baixando modelo '{model}'...", "processing")
             self.run_in_thread(
                 self._download_and_start,
                 args=(model, src, model_path, ids)
             )
+            return
+
+        # Caso modelo já esteja disponível: executa contagem
+        self.update_status("Iniciando contagem...", "info")
+        if show_video:
+            self.run_in_thread(self.execute_counting_thread, args=(src, model_path, ids))
         else:
-            self.update_status("Iniciando contagem...", "info")
-            self.run_in_thread(
-                self.execute_counting_thread,
-                args=(src, model_path, ids)
-            )
+            self.run_in_thread(self.execute_counting_thread_nvideo, args=(src, model_path, ids))
+
 
     def _download_and_start(self, model_filename, video_source, model_full_path, selected_ids):
         url = YOLO_MODELS.get(model_filename)
@@ -254,8 +294,9 @@ class App(ctk.CTk):
 
     def execute_counting_thread(self, video_source, model_path, selected_ids):
         self.after(0, lambda: self.update_status("Processando vídeo... Uma janela pode abrir.", "processing"))
+       
         try:
-            relatorio_path, saida_video_path = contar_veiculos(
+            relatorio_path  = contar_veiculos(
                 video_source,
                 AREAS_PATH,
                 model_path,
@@ -268,13 +309,38 @@ class App(ctk.CTk):
             messagebox.showinfo("Concluído", f"Relatório gerado em:\n{relatorio_path}")
         except Exception as e:
             logging.exception("Erro na contagem de veículos.")
-            self.after(0, lambda: self.update_status(f"Erro na contagem: {e}", "error"))
+            self.after(0, lambda err=e: self.update_status(f"Erro na contagem: {err}", "error"))
 
-    def show_report(self):
-        if not self.last_report_path or not os.path.exists(self.last_report_path):
-            messagebox.showwarning("Aviso", "Nenhum relatório disponível.")
-            return
-        self.open_report_file(self.last_report_path)
+
+    def execute_counting_thread_nvideo(self, video_source, model_path, selected_ids):
+        self.after(0, lambda: self.update_status("Contando (sem vídeo)...", "info"))
+
+        try:
+            relatorio_path = contar_veiculos_nVideo(
+                video_path=video_source,
+                areas_path=AREAS_PATH,
+                model_path=model_path,
+                classes_selecionadas=selected_ids,
+                camera_name=self.camera_name.get(),
+                stop_event=self.stop_flag
+            )
+            self.last_report_path = relatorio_path
+            self.after(0, lambda: self.update_status("Contagem finalizada!", "success"))
+            self.after(0, lambda: self.stop_counting_button.grid_remove())
+
+            if relatorio_path:
+                messagebox.showinfo("Relatório", f"Relatório salvo em:\n{relatorio_path}")
+
+        except Exception as e:
+            logging.exception("Erro na contagem de veículos.")
+            self.after(0, lambda err=e: self.update_status(f"Erro na contagem: {err}", "error"))
+
+
+
+    def stop_counting(self):
+        self.stop_flag.set()
+        self.update_status("Contagem interrompida manualmente.", "warning")
+
 
     def show_history(self):
         win = ctk.CTkToplevel(self)
@@ -432,6 +498,13 @@ class App(ctk.CTk):
 
     def run_in_thread(self, func, args=()):
         threading.Thread(target=func, args=args, daemon=True).start()
+
+    def show_report(self):
+        if not self.last_report_path or not os.path.exists(self.last_report_path):
+            messagebox.showwarning("Aviso", "Nenhum relatório disponível.")
+            return
+        self.open_report_file(self.last_report_path)
+
 
 
 if __name__ == "__main__":
