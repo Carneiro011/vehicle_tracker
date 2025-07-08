@@ -6,6 +6,7 @@ from ultralytics import YOLO
 import datetime
 import logging
 import sqlite3
+import torch
 import tkinter as tk
 from tkinter import messagebox
 
@@ -58,224 +59,216 @@ def contar_veiculos(
         camera_name=None
     ):
     """
-    Conta veículos em um vídeo usando YOLO, exibindo em tempo real hora local
-    e totais de entradas/saídas. Pergunta se deve salvar o relatório ao fechar
-    a janela. Se fornecido, inclui `camera_name` no cabeçalho e no nome do arquivo do relatório.
+    Conta veículos com YOLO em GPU (CUDA) e usa OpenCV CUDA para resize.
+    Aceita 1 área (entrada) ou 2 áreas (entrada + saída).
+    Exibe bounding boxes, IDs (se houver) e totais na tela e no relatório.
     """
     init_db()
-    logging.info("Iniciando contagem de veículos.")
     inicio_real = datetime.datetime.now()
+    logging.info("Iniciando contagem de veículos.")
 
-    # --- Preparar pasta e nome do relatório ---
+    # --- Preparar relatório ---
     os.makedirs("resultados", exist_ok=True)
-    ts_str = inicio_real.strftime("%Y%m%d_%H%M%S")
+    ts_str = inicio_real.strftime("%d-%m-%Y_%H%M%S")
     cam_str = camera_name.strip().replace(" ", "_") if camera_name else ""
-    nome_rel = f"relatorio_{ts_str}"
-    if cam_str:
-        nome_rel += f"_{cam_str}"
-    nome_rel += ".txt"
+    nome_rel = f"relatorio_{ts_str}" + (f"_{cam_str}" if cam_str else "") + ".txt"
     caminho_relatorio = os.path.join("resultados", nome_rel)
 
-    # --- Carregar áreas de entrada/saída ---
-    try:
-        with open(areas_path, "r", encoding="utf-8") as f:
-            areas = json.load(f)
-        if not (isinstance(areas, list) and len(areas) == 2):
-            raise ValueError("Esperado lista com 2 áreas (entrada, saída).")
-        for a in areas:
-            if not (isinstance(a, list) and len(a) >= 3):
-                raise ValueError("Cada área deve ter pelo menos 3 pontos.")
-        area_ent_orig = np.array(areas[0], dtype=np.int32)
-        area_sai_orig = np.array(areas[1], dtype=np.int32)
-    except Exception as e:
-        raise ValueError(f"Erro ao carregar áreas '{areas_path}': {e}")
+    # --- Carregar áreas ---
+    with open(areas_path, "r", encoding="utf-8") as f:
+        areas = json.load(f)
+    if not isinstance(areas, list) or len(areas) not in (1,2):
+        raise ValueError("Esperado lista com 1 (entrada) ou 2 (entrada, saída) áreas.")
+    for a in areas:
+        if not (isinstance(a, list) and len(a) >= 3):
+            raise ValueError("Cada área deve ter pelo menos 3 pontos.")
+    area_ent_orig = np.array(areas[0], dtype=np.int32)
+    area_sai_orig = np.array(areas[1], dtype=np.int32) if len(areas)==2 else None
 
-    # --- Carregar modelo YOLO ---
-    try:
-        modelo = YOLO(model_path)
-    except Exception as e:
-        raise RuntimeError(f"Erro ao carregar modelo '{model_path}': {e}")
+    # --- Carregar modelo na GPU/FP16 se possível ---
+    modelo = YOLO(model_path)
+    modelo.model.fuse()
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    modelo.to(device)
+    if device.startswith("cuda"):
+        modelo.model.half()
+        logging.info("Modelo em CUDA e FP16.")
+    else:
+        logging.warning("Inferência em CPU.")
 
-    # --- Preparar contadores e estruturas ---
-    TODAS_AS_CLASSES = {0:"Pessoa",1:"Bicicleta",2:"Carro",
-                       3:"Moto",5:"Onibus",7:"Caminhao"}
-    nomes_sel    = [TODAS_AS_CLASSES[c] for c in classes_selecionadas
-                    if c in TODAS_AS_CLASSES]
-    cont_ent     = {n:0 for n in nomes_sel}
-    cont_sai     = {n:0 for n in nomes_sel}
+    # --- Preparar estruturas de contagem ---
+    TODAS_AS_CLASSES = {0:"Pessoa",1:"Bicicleta",2:"Carro",3:"Moto",5:"Onibus",7:"Caminhao"}
+    nomes_sel = [TODAS_AS_CLASSES[c] for c in classes_selecionadas if c in TODAS_AS_CLASSES]
+    cont_ent, cont_sai = {n:0 for n in nomes_sel}, {n:0 for n in nomes_sel} if area_sai_orig is not None else {}
     ids_ent, ids_sai = set(), set()
-    estados      = {}
-    eventos_ent  = []
-    eventos_sai  = []
+    estados = {}
 
-    # --- Abrir vídeo ---
+    # --- Abrir vídeo e escalar polígonos ---
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Não foi possível abrir vídeo '{video_path}'.")
-    w_o = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h_o = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS)) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
+    w_o, h_o = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     w_out, h_out = 1280, 720
-
     fx, fy = w_out / w_o, h_out / h_o
-    area_ent = np.array([[int(x*fx), int(y*fy)] for x,y in area_ent_orig], dtype=np.int32)
-    area_sai = np.array([[int(x*fx), int(y*fy)] for x,y in area_sai_orig], dtype=np.int32)
+    area_ent = np.array([[int(x*fx),int(y*fy)] for x,y in area_ent_orig],dtype=np.int32)
+    area_sai = (np.array([[int(x*fx),int(y*fy)] for x,y in area_sai_orig],dtype=np.int32)
+                if area_sai_orig is not None else None)
 
-    # --- Configurar janela de exibição ---
-    window_name = "Processando - 'f' fullscreen, 'q' sair"
-    fullscreen = False
+    # --- Verificar OpenCV CUDA para resize ---
+    use_cuda_resize = cv2.cuda.getCudaEnabledDeviceCount()>0
+    if use_cuda_resize:
+        logging.info("OpenCV CUDA disponível para resize.")
+
+    # --- Janela de exibição ---
+    window_name = "Contagem - Q para sair"
     if show_video:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, w_out, h_out)
 
     break_on_x = False
 
-    # --- Loop de processamento de frames ---
+    # --- Loop principal ---
     while True:
         ret, frame = cap.read()
         if not ret:
-            break
+            break  # vídeo acabou
 
         t_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-        hora_evt = inicio_real + datetime.timedelta(seconds=(t_ms / 1000.0))
+        hora_evt = inicio_real + datetime.timedelta(seconds=(t_ms/1000.0))
 
-        frame = cv2.resize(frame, (w_out, h_out))
+        # resize
+        if use_cuda_resize:
+            gpu = cv2.cuda.GpuMat()
+            gpu.upload(frame)
+            gpu = cv2.cuda.resize(gpu, (w_out,h_out))
+            frame_resized = gpu.download()
+        else:
+            frame_resized = cv2.resize(frame, (w_out,h_out))
+
+        # inferência/tracking
         res = modelo.track(
-            source=frame,
+            source=frame_resized,
             tracker="botsort.yaml",
             persist=True,
             classes=classes_selecionadas
         )[0]
 
-        disp = frame.copy()
+        # preparar exibição
+        disp = frame_resized.copy()
         overlay = disp.copy()
         cv2.fillPoly(overlay, [area_ent], (0,255,0))
-        cv2.fillPoly(overlay, [area_sai], (0,0,255))
-        cv2.addWeighted(overlay, 0.3, disp, 0.7, 0, disp)
-        cv2.polylines(disp, [area_ent], True, (0,255,0), 2)
-        cv2.polylines(disp, [area_sai], True, (0,0,255), 2)
+        if area_sai is not None:
+            cv2.fillPoly(overlay, [area_sai], (0,0,255))
+        cv2.addWeighted(overlay,0.3,disp,0.7,0,disp)
+        cv2.polylines(disp,[area_ent],True,(0,255,0),2)
+        if area_sai is not None:
+            cv2.polylines(disp,[area_sai],True,(0,0,255),2)
+        cv2.putText(disp, hora_evt.strftime("%d/%m/%Y %H:%M:%S"),
+                    (10,20),FONT,0.6,(255,255,255),THICKNESS,LINE_TYPE)
 
-        cv2.putText(
-            disp,
-            hora_evt.strftime("%Y-%m-%d %H:%M:%S"),
-            (10, 20),
-            FONT,
-            0.6,
-            (255,255,255),
-            THICKNESS,
-            LINE_TYPE
-        )
+        # extrair boxes, classes e ids (ou None)
+        bxs  = res.boxes.xyxy.cpu().tolist()
+        clss = res.boxes.cls.int().cpu().tolist()
+        ids_  = (res.boxes.id.int().cpu().tolist()
+                 if hasattr(res.boxes,'id') and res.boxes.id is not None
+                 else [None]*len(bxs))
 
-        # Processa cada detecção com ID
-        if hasattr(res.boxes, 'id') and res.boxes.id is not None:
-            ids_ = res.boxes.id.int().cpu().tolist()
-            bxs  = res.boxes.xyxy.cpu().tolist()
-            clss = res.boxes.cls.int().cpu().tolist()
-            for (x1,y1,x2,y2), c, tid in zip(bxs, clss, ids_):
-                if c not in classes_selecionadas:
-                    continue
-                nome = TODAS_AS_CLASSES.get(c, "Desconhecido")
-                cx, cy = (int((x1+x2)/2), int((y1+y2)/2))
-                estados.setdefault(tid, {'in_entry':False, 'in_exit':False})
+        # processar cada detecção
+        for (x1,y1,x2,y2), c, tid in zip(bxs, clss, ids_):
+            if c not in classes_selecionadas:
+                continue
+            nome = TODAS_AS_CLASSES.get(c,"Desconhecido")
+            cx, cy = int((x1+x2)/2), int((y1+y2)/2)
 
-                # Verifica entrada
-                if cv2.pointPolygonTest(area_ent, (cx,cy), False) >= 0:
+            # contagem só se tivermos id
+            if tid is not None:
+                estados.setdefault(tid, {'in_entry':False,'in_exit':False})
+                # entrada
+                if cv2.pointPolygonTest(area_ent,(cx,cy),False)>=0:
                     if not estados[tid]['in_entry']:
-                        eventos_ent.append({'time':hora_evt, 'type':nome})
-                        if tid not in ids_ent:
-                            ids_ent.add(tid)
-                            cont_ent[nome] += 1
-                        estados[tid]['in_entry'] = True
+                        ids_ent.add(tid)
+                        cont_ent[nome]+=1
+                        estados[tid]['in_entry']=True
                 else:
-                    estados[tid]['in_entry'] = False
-
-                # Verifica saída
-                if cv2.pointPolygonTest(area_sai, (cx,cy), False) >= 0:
+                    estados[tid]['in_entry']=False
+                # saída
+                if area_sai is not None and cv2.pointPolygonTest(area_sai,(cx,cy),False)>=0:
                     if not estados[tid]['in_exit']:
-                        eventos_sai.append({'time':hora_evt, 'type':nome})
-                        if tid not in ids_sai:
-                            ids_sai.add(tid)
-                            cont_sai[nome] += 1
-                        estados[tid]['in_exit'] = True
+                        ids_sai.add(tid)
+                        cont_sai[nome]+=1
+                        estados[tid]['in_exit']=True
                 else:
-                    estados[tid]['in_exit'] = False
+                    if area_sai is not None:
+                        estados[tid]['in_exit']=False
 
-                # Desenha bbox e label
-                cv2.rectangle(disp, (int(x1),int(y1)), (int(x2),int(y2)), (255,0,0), 1)
-                cv2.putText(
-                    disp,
-                    f"{nome} ID:{tid}",
-                    (int(x1), int(y1)-6),
-                    FONT,
-                    0.5,
-                    (255,0,0),
-                    THICKNESS,
-                    LINE_TYPE
-                )
+            # desenhar bbox + label (sempre)
+            cv2.rectangle(disp,(int(x1),int(y1)),(int(x2),int(y2)),(255,0,0),1)
+            label = nome + (f" ID:{tid}" if tid is not None else "")
+            cv2.putText(disp,label,(int(x1),int(y1)-6),FONT,0.5,(255,0,0),THICKNESS,LINE_TYPE)
 
-        # Mostra contadores na tela
+        # sobrepor contadores e totais
         y = 40
-        cv2.putText(disp, "ENTRADAS:", (10, y), FONT, 0.8, (0,255,0), THICKNESS, LINE_TYPE)
-        y += 25
-        for n, cnt in cont_ent.items():
-            cv2.putText(disp, f"{n}: {cnt}", (10, y), FONT, 0.5, (0,255,0), THICKNESS, LINE_TYPE)
-            y += 20
+        cv2.putText(disp,"ENTRADAS:",(10,y),FONT,0.8,(0,255,0),THICKNESS,LINE_TYPE)
+        for n,cnt in cont_ent.items():
+            y+=20
+            cv2.putText(disp,f"{n}: {cnt}",(10,y),FONT,0.6,(0,255,0),THICKNESS,LINE_TYPE)
+        y+=20
+        cv2.putText(disp,f"Total Entradas: {len(ids_ent)}",(10,y),FONT,0.6,(0,255,0),THICKNESS,LINE_TYPE)
 
-        y += 10
-        cv2.putText(disp, "SAIDAS:", (10, y), FONT, 0.8, (0,0,255), THICKNESS, LINE_TYPE)
-        y += 25
-        for n, cnt in cont_sai.items():
-            cv2.putText(disp, f"{n}: {cnt}", (10, y), FONT, 0.6, (0,0,255), THICKNESS, LINE_TYPE)
-            y += 20
+        if area_sai is not None:
+            y+=30
+            cv2.putText(disp,"SAÍDAS:",(10,y),FONT,0.8,(0,0,255),THICKNESS,LINE_TYPE)
+            for n,cnt in cont_sai.items():
+                y+=20
+                cv2.putText(disp,f"{n}: {cnt}",(10,y),FONT,0.6,(0,0,255),THICKNESS,LINE_TYPE)
+            y+=20
+            cv2.putText(disp,f"Total Saídas: {len(ids_sai)}",(10,y),FONT,0.6,(0,0,255),THICKNESS,LINE_TYPE)
 
+        # exibir frame
         if show_video:
-            cv2.imshow(window_name, disp)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('f'):
-                fullscreen = not fullscreen
-                mode = cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL
-                cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, mode)
-            if key == ord('q'):
-                break
-            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
-                break_on_x = True
+            cv2.imshow(window_name,disp)
+            key = cv2.waitKey(1)&0xFF
+            if key==ord('q') or cv2.getWindowProperty(window_name,cv2.WND_PROP_VISIBLE)<1:
+                break_on_x=True
                 break
 
-    # --- Limpa recursos ---
     cap.release()
     if show_video:
         cv2.destroyAllWindows()
 
     fim_real = datetime.datetime.now()
-
-    # --- Pergunta se salva relatório ---
-    save = True
+    save=True
     if break_on_x:
-        root = tk.Tk(); root.withdraw()
-        save = messagebox.askyesno("Salvar Relatório", "Deseja salvar o relatório?")
+        root=tk.Tk(); root.withdraw()
+        save=messagebox.askyesno("Salvar Relatório","Deseja salvar o relatório?")
         root.destroy()
 
     if save:
-        with open(caminho_relatorio, "w", encoding="utf-8") as f:
+        with open(caminho_relatorio,"w",encoding="utf-8") as f:
             f.write("RELATÓRIO DE CONTAGEM DE VEÍCULOS\n")
             if camera_name:
                 f.write(f"CÂMERA: {camera_name}\n")
-            f.write(f"Início da contagem: {inicio_real.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Fim da contagem:    {fim_real.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            duracao = fim_real - inicio_real
-            f.write(f"Duração:            {str(duracao)}\n")
-            f.write("="*40 + "\n\n")
-            f.write("TOTAIS GERAIS (IDs únicos):\n")
+            f.write(f"Início: {inicio_real.strftime('%d/%m/%Y %H:%M:%S')}\n")
+            f.write(f"Fim:    {fim_real.strftime('%d/%m/%Y %H:%M:%S')}\n")
+            f.write(f"Duração: {fim_real - inicio_real}\n")
+            f.write("="*40+"\n\n")
+            f.write("ENTRADAS:\n")
             for n in nomes_sel:
-                f.write(f"  Entrada {n}: {cont_ent[n]}\n")
+                f.write(f"  {n}: {cont_ent[n]}\n")
             f.write(f"  Total IDs entrada: {len(ids_ent)}\n\n")
-            for n in nomes_sel:
-                f.write(f"  Saída {n}: {cont_sai[n]}\n")
-            f.write(f"  Total IDs saída: {len(ids_sai)}\n\n")
+            if area_sai is not None:
+                f.write("SAÍDAS:\n")
+                for n in nomes_sel:
+                    f.write(f"  {n}: {cont_sai[n]}\n")
+                f.write(f"  Total IDs saída: {len(ids_sai)}\n")
         logging.info(f"Relatório gravado em '{caminho_relatorio}'")
-        now_iso = datetime.datetime.now().isoformat(sep=' ', timespec='seconds')
-        log_report(now_iso, caminho_relatorio, video_path, os.path.basename(model_path))
+        log_report(
+            datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            caminho_relatorio,
+            video_path,
+            os.path.basename(model_path)
+        )
         return caminho_relatorio
     else:
-        logging.info("Usuário optou por não salvar o relatório.")
+        logging.info("Relatório não salvo.")
         return None
